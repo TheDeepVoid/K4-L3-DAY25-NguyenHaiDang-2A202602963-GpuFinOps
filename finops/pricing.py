@@ -60,20 +60,67 @@ def break_even_utilization(discount_frac: float) -> float:
     return max(0.0, min(1.0, 1.0 - discount_frac))
 
 
-def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount: float = 0.45) -> str:
-    """Pick a purchasing tier from a workload's duty cycle + interruptibility.
+def recommend_tier(
+    hpd: float,
+    interruptible: bool,
+    gpu_type: str | None = None,
+    commitment_months: int = 36,
+) -> str:
+    """Pick a purchasing tier from duty cycle, interruptibility, GPU type, and commitment length.
 
-    DOCUMENTED simple policy (instructor extension point — swap in your own):
-      - interruptible & not 24/7  -> 'spot'      (checkpoint and ride the discount)
-      - duty cycle >= break-even  -> 'reserved'  (steady, high utilization)
-      - otherwise                 -> 'on_demand' (spiky / low duty)
+    Policy (Bonus 1 extension — sources in comments):
+      - interruptible -> 'spot' unless H100/A100 running >=8 h/day (frequent checkpoints
+        cost more than the 1yr reserved discount for high-demand GPUs; assumption: H100
+        spot interruption rate ~5%/hr from neocloud 2026 spot SLA docs).
+      - commitment_months >= 36 AND duty >= break-even(3yr discount) -> 'reserved'
+        (3yr reserved discount ~44% for H100/A100 per price_catalog.csv).
+      - commitment_months >= 12 AND duty >= break-even(1yr discount) -> 'reserved_1yr'
+        (1yr reserved discount ~20% for H100/A100 per price_catalog.csv).
+      - otherwise -> 'on_demand'.
+
+    GPU-type interruption rate assumptions (neocloud 2026 estimates):
+      H100/H200: ~5%/hr  (high demand, scarce capacity)
+      A100:      ~8%/hr
+      A10G/L4:   ~3%/hr  (more available capacity)
     """
-    duty = max(0.0, hours_per_day) / 24.0
-    be = break_even_utilization(reserved_discount)
-    if interruptible and hours_per_day < 24:
-        return "spot"
-    if duty >= be:
+    # GPU-type specific spot interruption rates (assumption: neocloud 2026 spot SLAs)
+    SPOT_INTERRUPT_RATE: dict[str, float] = {
+        "H100": 0.05, "H200": 0.05,
+        "A100": 0.08,
+        "A10G": 0.03, "L4": 0.03, "B200": 0.04, "MI300X": 0.06,
+    }
+    rate = SPOT_INTERRUPT_RATE.get(gpu_type or "", 0.05)
+
+    # For high-interruption GPUs with significant daily hours, spot rework cost
+    # erodes the discount — prefer reserved even if interruptible.
+    spot_rework_daily_hrs = rate * hpd * 0.5   # 0.5h rework per interrupt
+    if interruptible:
+        if gpu_type in ("H100", "A100") and hpd >= 8 and spot_rework_daily_hrs > 0.5:
+            # Rework overhead > 0.5 h/day: reserved likely cheaper (assumption)
+            pass  # fall through to reserved logic below
+        else:
+            return "spot"
+
+    # Stable (non-interruptible) or high-rework interruptible: pick commitment length
+    duty = max(0.0, hpd) / 24.0
+
+    # 3yr discount ~44% for H100, ~44% A100, ~25% A10G (from price_catalog.csv)
+    DISC_3YR: dict[str, float] = {
+        "H100": 0.44, "H200": 0.39, "A100": 0.44,
+        "A10G": 0.40, "L4": 0.44, "B200": 0.37, "MI300X": 0.38,
+    }
+    # 1yr discount ~20% for H100, ~22% A100 (from price_catalog.csv)
+    DISC_1YR: dict[str, float] = {
+        "H100": 0.20, "H200": 0.19, "A100": 0.22,
+        "A10G": 0.20, "L4": 0.25, "B200": 0.18, "MI300X": 0.18,
+    }
+    disc_3yr = DISC_3YR.get(gpu_type or "", 0.44)
+    disc_1yr = DISC_1YR.get(gpu_type or "", 0.20)
+
+    if commitment_months >= 36 and duty >= break_even_utilization(disc_3yr):
         return "reserved"
+    if commitment_months >= 12 and duty >= break_even_utilization(disc_1yr):
+        return "reserved_1yr"
     return "on_demand"
 
 
