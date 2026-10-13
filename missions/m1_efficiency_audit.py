@@ -13,50 +13,82 @@ RIGHTSIZE_MAP = {"H100": "A100", "H200": "H100", "A100": "A10G", "A10G": "L4", "
 
 
 def _rightsize_recommend(summary, cat) -> list[dict]:
-    """Suggest right-size GPU for each GPU based on MBU and cost/GB-VRAM."""
+    """Suggest right-size GPU for each GPU based on MBU, VRAM usage, and bandwidth.
+
+    Checks:
+      1. VRAM capacity: target hbm_gb must fit workload peak memory (avoids OOM).
+      2. Memory bandwidth: target peak_bw_tbs must satisfy achieved bandwidth.
+      3. Cost/GB-VRAM and hourly rate comparison.
+    Limitation noted: requires empirical serving benchmark before production rollout
+    to guarantee latency SLA is maintained.
+    """
     recs = []
     for s in summary:
         cur = s["gpu_type"]
-        peak_cur = num(cat[cur]["peak_bw_tbs"])
+        peak_cur_bw = num(cat[cur]["peak_bw_tbs"])
         hbm_cur = num(cat[cur]["hbm_gb"])
         ondemand_cur = num(cat[cur]["on_demand_hr"])
         mbu_cur = s["mbu"]
+        max_mem = s.get("max_mem_gb", 0.0)
+        avg_bw = s.get("avg_bw_tbs", 0.0)
 
-        # Target: move one step down in the rightsize map
+        # Target candidate
         tgt = RIGHTSIZE_MAP.get(cur, cur)
-        peak_tgt = num(cat[tgt]["peak_bw_tbs"])
+        peak_tgt_bw = num(cat[tgt]["peak_bw_tbs"])
         hbm_tgt = num(cat[tgt]["hbm_gb"])
         ondemand_tgt = num(cat[tgt]["on_demand_hr"])
 
-        # Cost per GB VRAM comparison
         cost_per_gb_cur = ondemand_cur / hbm_cur if hbm_cur else float("inf")
         cost_per_gb_tgt = ondemand_tgt / hbm_tgt if hbm_tgt else float("inf")
-
-        # Savings from right-sizing (idle hours already counted separately)
         delta_per_hr = max(0.0, ondemand_cur - ondemand_tgt)
         delta_monthly = delta_per_hr * 24 * 30
 
-        # Only recommend if moving down improves cost per GB or keeps it equal
-        cost_better = cost_per_gb_tgt <= cost_per_gb_cur
+        # Feasibility checks
+        vram_fits = hbm_tgt >= max_mem
+        bw_sufficient = peak_tgt_bw >= avg_bw
+        is_lie_or_low_mbu = (s["gpu_util_pct"] >= 90 and s["mfu"] < 0.30) or (mbu_cur < 0.35)
 
-        # Compute target MBU safely
-        peak_tgt_val = num(cat[tgt]["peak_tflops_fp16"])
-        target_mbu = round(peak_tgt / (peak_tgt_val / 1000), 3) if peak_tgt_val else 0.0
+        if cur == tgt:
+            status = "optimal"
+            reason = f"Đã ở tier thấp nhất ({cur}). Không thể hạ thêm."
+            savings = 0.0
+            rec_gpu = cur
+        elif not vram_fits:
+            status = "rejected_vram"
+            reason = f"Không thể hạ sang {tgt}: VRAM cần {max_mem:.1f}GB > {tgt} ({hbm_tgt:.0f}GB)."
+            savings = 0.0
+            rec_gpu = cur
+        elif not bw_sufficient:
+            status = "rejected_bw"
+            reason = f"Không thể hạ sang {tgt}: Cần bandwidth {avg_bw:.2f} TB/s > {tgt} peak ({peak_tgt_bw:.2f} TB/s)."
+            savings = 0.0
+            rec_gpu = cur
+        elif not is_lie_or_low_mbu and mbu_cur >= 0.40:
+            status = "retained"
+            reason = f"Giữ {cur}: MBU={mbu_cur:.2f} và MFU={s['mfu']:.2f} đang sử dụng tốt tài nguyên."
+            savings = 0.0
+            rec_gpu = cur
+        else:
+            status = "recommended"
+            reason = (
+                f"Đề xuất {cur} -> {tgt}: VRAM đủ ({max_mem:.1f}GB <= {hbm_tgt:.0f}GB), "
+                f"BW đủ ({avg_bw:.2f} <= {peak_tgt_bw:.2f} TB/s), "
+                f"tiết kiệm ${cost_per_gb_cur:.4f}->${cost_per_gb_tgt:.4f}/GB-hr (${delta_monthly:,.0f}/tháng). "
+                f"[Giới hạn: Cần load-test benchmark trước khi áp dụng production]"
+            )
+            savings = delta_monthly
+            rec_gpu = tgt
 
         recs.append({
             "gpu_id": s["gpu_id"],
             "current": cur,
-            "target": tgt,
+            "target": rec_gpu,
+            "status": status,
+            "max_mem_gb": max_mem,
+            "hbm_target_gb": hbm_tgt,
             "current_mbu": round(mbu_cur, 3),
-            "target_mbu": target_mbu,
-            "current_cost_per_gb": round(cost_per_gb_cur, 4),
-            "target_cost_per_gb": round(cost_per_gb_tgt, 4),
-            "monthly_savings_usd": round(delta_monthly, 2),
-            "reason": (
-                f"MBU {mbu_cur:.2f} -> target {target_mbu:.2f}; "
-                f"${cost_per_gb_cur:.4f}/GB -> ${cost_per_gb_tgt:.4f}/GB; "
-                f"${delta_monthly:.0f}/mo savings"
-            ) if cost_better else f"Keeping {cur} (MBU adequate, cost per GB not improved)",
+            "monthly_savings_usd": round(savings, 2),
+            "reason": reason,
         })
     return recs
 
@@ -66,7 +98,7 @@ def run(verbose: bool = True) -> dict:
     cat = catalog_by_type()
 
     # per-row MFU/MBU, then aggregate per GPU
-    agg = defaultdict(lambda: {"util": [], "mfu": [], "mbu": [], "type": None, "idle_hours": 0})
+    agg = defaultdict(lambda: {"util": [], "mfu": [], "mbu": [], "type": None, "idle_hours": 0, "mem": [], "bw": []})
     for r in tel:
         gtype = r["gpu_type"]
         peak_fp16 = num(cat[gtype]["peak_tflops_fp16"])
@@ -78,6 +110,8 @@ def run(verbose: bool = True) -> dict:
         a["util"].append(num(r["gpu_util_pct"]))
         a["mfu"].append(mfu)
         a["mbu"].append(mbu)
+        a["mem"].append(num(r.get("mem_used_gb", 0)))
+        a["bw"].append(num(r.get("achieved_bw_tbs", 0)))
         if num(r["gpu_util_pct"]) < 10:  # effectively idle this interval (1h)
             a["idle_hours"] += 1
 
@@ -89,6 +123,8 @@ def run(verbose: bool = True) -> dict:
             "mfu": round(sum(a["mfu"]) / len(a["mfu"]), 3),
             "mbu": round(sum(a["mbu"]) / len(a["mbu"]), 3),
             "idle_hours": a["idle_hours"],
+            "max_mem_gb": round(max(a["mem"]), 1) if a["mem"] else 0.0,
+            "avg_bw_tbs": round(sum(a["bw"]) / len(a["bw"]), 3) if a["bw"] else 0.0,
         })
 
     lies = metrics.flag_util_lies(summary)
