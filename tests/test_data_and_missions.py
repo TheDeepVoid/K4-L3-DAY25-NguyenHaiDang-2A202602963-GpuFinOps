@@ -25,3 +25,14 @@ def test_missions_end_to_end():
     assert 0.85 <= r4["tag_coverage"] <= 1.0
     r5 = m5_report.run(verbose=False)
     assert 40 <= r5["total_savings_pct"] <= 95
+
+
+def test_carbon_aware_schedule():
+    from finops.sustainability import carbon_aware_schedule
+    from missions._common import load_csv, catalog_by_type
+    jobs = load_csv("workloads.csv")
+    cat = catalog_by_type()
+    plan = carbon_aware_schedule(jobs, cat, days=30)
+    assert plan["carbon_saved_kg"] > 0
+    assert plan["carbon_saved_pct"] > 80  # europe-north1 is >90% cleaner than us-east-1
+    assert plan["electricity_saved_usd"] > 0
