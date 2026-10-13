@@ -43,13 +43,44 @@ def run(verbose: bool = True) -> dict:
     optimized = baseline - sum(levers.values())
     total_pct = sum(levers.values()) / baseline * 100 if baseline else 0.0
 
-    # --- sustainability snapshot ---
-    median_tokens = 800
-    wh = sustainability.wh_per_query(median_tokens)
+    # --- sustainability with reasoning breakdown ---
+    # Get token counts from M2 data
+    total_tokens = r2["total_tokens"]
+    reasoning_tokens = r2.get("reasoning_tokens", 0)
+    non_reasoning_tokens = r2.get("non_reasoning_tokens", 0)
+
+    # If M2 didn't pass reasoning tokens, estimate from is_reasoning column
+    if reasoning_tokens == 0 or non_reasoning_tokens == 0:
+        # Re-count from token_usage.csv
+        import csv
+        rows = []
+        with open(os.path.join(ROOT, "data", "token_usage.csv"), newline="") as f:
+            for r in csv.DictReader(f):
+                rows.append(r)
+        rt = sum((int(r["input_tokens"]) + int(r["output_tokens"])) for r in rows if int(r.get("is_reasoning", 0)))
+        nrt = total_tokens - rt
+        reasoning_tokens = rt
+        non_reasoning_tokens = nrt
+
+    wh_reasoning = sustainability.wh_per_query(reasoning_tokens, is_reasoning=True)
+    wh_non_reasoning = sustainability.wh_per_query(non_reasoning_tokens, is_reasoning=False)
+    carbon_reasoning = sustainability.carbon_g(wh_reasoning)
+    carbon_non_reasoning = sustainability.carbon_g(wh_non_reasoning)
+    energy_cost_reasoning = sustainability.energy_cost_usd(wh_reasoning)
+    energy_cost_non_reasoning = sustainability.energy_cost_usd(wh_non_reasoning)
+
+    # --- sustainability summary ---
     sust = {
-        "wh_per_query": wh,
-        "carbon_g": sustainability.carbon_g(wh, "us-east-1"),
+        "wh_per_query": round((wh_reasoning + wh_non_reasoning) / max(1, reasoning_tokens + non_reasoning_tokens) * 1e6, 2),
+        "carbon_g": round(carbon_reasoning + carbon_non_reasoning, 3),
         "best_region": min(sustainability.REGION_CARBON, key=sustainability.REGION_CARBON.get),
+        "reasoning_wh": round(wh_reasoning, 2),
+        "non_reasoning_wh": round(wh_non_reasoning, 2),
+        "reasoning_carbon": round(carbon_reasoning, 3),
+        "non_reasoning_carbon": round(carbon_non_reasoning, 3),
+        "reasoning_energy_cost": round(energy_cost_reasoning, 4),
+        "non_reasoning_energy_cost": round(energy_cost_non_reasoning, 4),
+        "reasoning_pct_tokens": round(reasoning_tokens / total_tokens * 100, 1) if total_tokens else 0.0,
     }
 
     md = report.build_report(baseline, optimized, levers, sustainability=sust)
