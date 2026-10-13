@@ -16,8 +16,15 @@
 
 ## Sustainability
 
-- Energy per query: 0.24 Wh
-- Carbon per query: 0.091 gCO2e
+- Energy per query: 4204.86 Wh
+- Carbon per query: 12036.616 gCO2e
 - Cheapest+cleanest region: europe-north1
+
+### Reasoning Budget & Carbon Impact (Extension 4)
+
+- Reasoning traffic share: 8.4% requests (16.5% tokens)
+- Reasoning energy share: 29,787.7 Wh (94.0% total inference Wh)
+- 10% traffic cap evaluation: traffic is currently 8.4% (<= 10% cap) => cap savings = $0.00 / 0.0 Wh
+- Recommendation: Gate reasoning to complex evaluation tasks (eval, deep research); standard chat/search routes to cascade
 
 _Figures are June-2026 as-of snapshots; re-baseline before acting._

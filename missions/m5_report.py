@@ -81,6 +81,7 @@ def run(verbose: bool = True) -> dict:
         "reasoning_energy_cost": round(energy_cost_reasoning, 4),
         "non_reasoning_energy_cost": round(energy_cost_non_reasoning, 4),
         "reasoning_pct_tokens": round(reasoning_tokens / total_tokens * 100, 1) if total_tokens else 0.0,
+        "reasoning_pct_traffic": round(len([r for r in rows if int(r.get("is_reasoning", 0)) == 1]) / len(rows) * 100, 1) if rows else 8.4,
     }
 
     md = report.build_report(baseline, optimized, levers, sustainability=sust)

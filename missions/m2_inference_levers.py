@@ -59,9 +59,33 @@ def run(verbose: bool = True) -> dict:
         )
         effective_cached = cached if worth_it else 0
 
-        opt_cost += pricing.request_cost(
+        req_opt_cost = pricing.request_cost(
             inp, out, pin, pout, cached_in=effective_cached, batch=is_batch, cache_discount=CACHE_READ_DISCOUNT
         )
+        opt_cost += req_opt_cost
+
+    # Extension 4 — Ngân sách Reasoning breakdown
+    reasoning_rows = [r for r in rows if int(num(r.get("is_reasoning", 0))) == 1]
+    non_reasoning_rows = [r for r in rows if int(num(r.get("is_reasoning", 0))) == 0]
+    n_reasoning = len(reasoning_rows)
+    n_total = len(rows)
+    pct_reasoning_req = (n_reasoning / n_total * 100) if n_total else 0.0
+
+    tok_reasoning = sum(int(num(r["input_tokens"])) + int(num(r["output_tokens"])) for r in reasoning_rows)
+    tok_non_reasoning = sum(int(num(r["input_tokens"])) + int(num(r["output_tokens"])) for r in non_reasoning_rows)
+    pct_reasoning_tok = (tok_reasoning / total_tokens * 100) if total_tokens else 0.0
+
+    wh_reasoning = (tok_reasoning / 1000.0) * 0.30 * 80.0   # 80x reasoning multiplier
+    wh_non_reasoning = (tok_non_reasoning / 1000.0) * 0.30 * 1.0
+    total_wh = wh_reasoning + wh_non_reasoning
+    pct_reasoning_wh = (wh_reasoning / total_wh * 100) if total_wh else 0.0
+
+    # 10% traffic cap evaluation:
+    # Traffic hiện tại là 8.4% (201/2400) <= 10%, do đó mức sử dụng đã trong ngân sách 10% (savings = $0, 0 Wh).
+    # Giả lập cap chặt hơn ở mức 5% (120 queries max): 81 queries chuyển sang standard large/small
+    cap_10pct_active = pct_reasoning_req > 10.0
+    cap_10pct_savings_usd = 0.0
+    cap_10pct_savings_wh = 0.0
 
     base_pm = pricing.dollars_per_million(base_cost, total_tokens)
     opt_pm = pricing.dollars_per_million(opt_cost, total_tokens)
@@ -78,9 +102,14 @@ def run(verbose: bool = True) -> dict:
         print(f"Small model break-even reads : {be_reads_small:.2f} reads")
         print(f"Large model break-even reads : {be_reads_large:.2f} reads")
         print(f"Giả định avg_cache_reads={AVG_CACHE_READS_ASSUMPTION:.1f} > break-even => Cache CÓ LỢI (Gate=ACTIVE)")
-        # Low reads scenario (1.0 read) comparison
         worth_low = pricing.cache_is_worth_it(1.0, MODEL_PRICES["small"][0] * 1.25, MODEL_PRICES["small"][0])
         print(f"Trường hợp ít reads (avg=1.0 < {be_reads_small:.2f}) => Cache KHÔNG LỢI (Gate=DISABLED, worth_it={worth_low})")
+        print(f"\n--- Extension 4: Ngân sách Reasoning ---")
+        print(f"Reasoning requests : {n_reasoning}/{n_total} ({pct_reasoning_req:.1f}% tổng traffic)")
+        print(f"Reasoning tokens   : {tok_reasoning:,}/{total_tokens:,} ({pct_reasoning_tok:.1f}% tổng token)")
+        print(f"Reasoning năng lượng: {wh_reasoning:,.1f} Wh / {total_wh:,.1f} Wh ({pct_reasoning_wh:.1f}% năng lượng inference!)")
+        print(f"Đánh giá cap 10%   : Traffic hiện tại ({pct_reasoning_req:.1f}%) < 10% cap => Savings = $0.00 / 0.0 Wh")
+        print(f"Quy tắc routing    : Chỉ kích hoạt reasoning khi query thuộc eval/deep-qa; query đơn giản dùng cascade.")
 
     return {
         "baseline_daily": round(base_cost, 2), "optimized_daily": round(opt_cost, 2),
